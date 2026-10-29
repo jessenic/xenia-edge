@@ -574,9 +574,9 @@ dword_result_t XamContentOpenFile_entry(
     // image.
     auto entry = dynamic_cast<vfs::HostPathEntry*>(
         kernel_state()->file_system()->ResolvePath(path));
-    if (entry && kernel_state()->content_manager()->OpenAndMountPackage(
-                     entry->host_path(), root_name)) {
-      result = X_ERROR_SUCCESS;
+    if (entry) {
+      result = kernel_state()->content_manager()->OpenContentFile(
+          root_name, entry->host_path());
     }
     auto disposition = XSUCCEEDED(result) ? kDispositionState::Open
                                           : kDispositionState::Unknown;
