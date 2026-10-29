@@ -62,9 +62,11 @@ bool XNotifyListener::DequeueNotification(XNotificationID* out_id,
     *out_id = it->first;
     *out_data = it->second;
     notifications_.erase(it);
-    if (!notifications_.size()) {
-      wait_handle_->Reset();
-    }
+  }
+  // Also reset when nothing was queued: a filtered read may have taken the
+  // last notification and left the handle signaled.
+  if (notifications_.empty()) {
+    wait_handle_->Reset();
   }
   return dequeued;
 }
