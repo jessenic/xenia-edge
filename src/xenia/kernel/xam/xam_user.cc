@@ -11,9 +11,12 @@
 #include <cstring>
 #include <iterator>
 #include <mutex>
+#include <random>
+#include <string>
 #include <string_view>
 #include <utility>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/utf8.h"
 #include "xenia/emulator.h"
@@ -31,6 +34,12 @@
 #include "xenia/kernel/xconfig.h"
 
 enum X_USER_AGE_GROUP : uint32_t { CHILD, TEEN, ADULT };
+
+DEFINE_bool(fake_xauth_tokens, false,
+            "Hands titles a made-up LIVE security token for the services they "
+            "ask for, where the console gets a real one from LIVE. The token "
+            "is sent to the title's own servers, which may reject it.",
+            "Live");
 
 namespace xe {
 namespace kernel {
@@ -1508,6 +1517,7 @@ struct X_XAM_TOKEN {
 };
 static_assert_size(X_XAM_TOKEN, 0xC);
 
+constexpr uint32_t kXamTokenTypeSecurity = 1;
 constexpr uint32_t kXamTokenTypeAppliesTo = 2;
 constexpr uint32_t kXamTokenMaxDataLength = 0x800;
 constexpr uint32_t kXamTokenMaxAppliesToLength = 0x400;
@@ -1596,9 +1606,43 @@ dword_result_t XamGetToken_entry(dword_t user_index, lpvoid_t applies_to_ptr,
   // failure is returned before anything is queued, so the overlapped is left
   // alone, as xam does for failures it finds up front; XamlHost treats a
   // non-pending result as finished and doesn't wait on it.
-  return X_ERROR_NOT_SUPPORTED;
+  if (!cvars::fake_xauth_tokens) {
+    return X_ERROR_NOT_SUPPORTED;
+  }
+
+  // A real token is an encrypted blob only LIVE and the service can read,
+  // sent as base64 text. This one is random bytes of a similar size.
+  std::string_view applies_to;
+  if (applies_to_ptr) {
+    applies_to =
+        std::string_view(applies_to_ptr.as<const char*>(), applies_to_length);
+    applies_to = applies_to.substr(0, applies_to.find('\0'));
+  }
+  static constexpr char kBase64[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::random_device random;
+  std::string text;
+  for (size_t i = 0; i < 0x2A0 / 3; ++i) {
+    const uint32_t bits = random() & 0xFFFFFF;
+    text += kBase64[(bits >> 18) & 63];
+    text += kBase64[(bits >> 12) & 63];
+    text += kBase64[(bits >> 6) & 63];
+    text += kBase64[bits & 63];
+  }
+  XELOGI("XamGetToken: made up a token for {}", applies_to);
+  const uint32_t token = AllocateXamToken(kXamTokenTypeSecurity, text);
+  if (!token) {
+    return X_ERROR_NOT_ENOUGH_MEMORY;
+  }
+  *token_ptr = token;
+  if (overlapped_ptr) {
+    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr,
+                                                X_ERROR_SUCCESS);
+    return X_ERROR_IO_PENDING;
+  }
+  return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamGetToken, kUserProfiles, kStub);
+DECLARE_XAM_EXPORT1(XamGetToken, kUserProfiles, kSketchy);
 
 void XamFreeToken_entry(dword_t token_ptr) {
   if (token_ptr) {
