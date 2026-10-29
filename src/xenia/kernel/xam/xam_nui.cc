@@ -222,8 +222,7 @@ DECLARE_XAM_EXPORT1(XamNuiCameraSetFlags, kNone, kStub);
 // The tilt motor calls below all start by asking for the controller type and
 // fail with device-not-connected when no Kinect is attached.
 static X_HRESULT NuiTiltMotorRequest(const char* name) {
-  const uint32_t controller_type = XamNuiCameraGetTiltControllerType_entry();
-  if (controller_type == 0 || controller_type >= 3) {
+  if (!XamNuiCameraGetTiltControllerType_entry()) {
     return X_E_DEVICE_NOT_CONNECTED;
   }
   // TODO(knuckleslee): Drive the tilt motor once a Kinect can be emulated.
