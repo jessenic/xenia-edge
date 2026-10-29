@@ -30,6 +30,7 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+#include "xenia/vfs/devices/host_path_entry.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/xbox.h"
@@ -562,10 +563,42 @@ dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  // Mounts the content package stored in a file, such as a Kinect speech
+  // database (GAME:\nuisp1033p), under root_name.
   // TODO(gibbed): arguments assumed based on XamContentCreate.
-  return X_ERROR_FILE_NOT_FOUND;
+  auto run = [path = path.value(), root_name = root_name.value(),
+              disposition_ptr, license_mask_ptr](uint32_t& extended_error,
+                                                 uint32_t& length) -> X_RESULT {
+    X_RESULT result = X_ERROR_FILE_NOT_FOUND;
+    // Packages are opened from host files, so this misses ones inside a disc
+    // image.
+    auto entry = dynamic_cast<vfs::HostPathEntry*>(
+        kernel_state()->file_system()->ResolvePath(path));
+    if (entry && kernel_state()->content_manager()->OpenAndMountPackage(
+                     entry->host_path(), root_name)) {
+      result = X_ERROR_SUCCESS;
+    }
+    auto disposition = XSUCCEEDED(result) ? kDispositionState::Open
+                                          : kDispositionState::Unknown;
+    if (disposition_ptr) {
+      *disposition_ptr = static_cast<uint32_t>(disposition);
+    }
+    if (license_mask_ptr && XSUCCEEDED(result)) {
+      *license_mask_ptr = 0;
+    }
+    extended_error = X_HRESULT_FROM_WIN32(result);
+    length = static_cast<uint32_t>(disposition);
+    return result;
+  };
+
+  if (!overlapped_ptr) {
+    uint32_t extended_error, length;
+    return run(extended_error, length);
+  }
+  kernel_state()->CompleteOverlappedDeferredEx(run, overlapped_ptr);
+  return X_ERROR_IO_PENDING;
 }
-DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kStub);
+DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kSketchy);
 
 dword_result_t XamContentFlush_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
