@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <atomic>
+
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xthread.h"
@@ -64,6 +66,60 @@ dword_result_t XamMediaVerificationInject_entry(dword_t r3, dword_t r4) {
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamMediaVerificationInject, kNone, kStub);
+
+// xam keeps the closed captioning switch and style in two console config
+// settings that xenia's config doesn't have, so they live here. Captions start
+// off with the default style.
+static std::atomic<uint8_t> closed_captioning_enabled_ = 0;
+static std::atomic<uint32_t> closed_captioning_settings_ = 0;
+
+dword_result_t XamGetClosedCaptioningState_entry() {
+  return closed_captioning_enabled_.load();
+}
+DECLARE_XAM_EXPORT1(XamGetClosedCaptioningState, kNone, kImplemented);
+
+void XamSetClosedCaptioningState_entry(dword_t enabled) {
+  closed_captioning_enabled_ = static_cast<uint8_t>(enabled);
+}
+DECLARE_XAM_EXPORT1(XamSetClosedCaptioningState, kNone, kImplemented);
+
+dword_result_t XamGetClosedCaptioningSettings_entry(lpdword_t settings_ptr) {
+  if (!settings_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  *settings_ptr = closed_captioning_settings_.load();
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamGetClosedCaptioningSettings, kNone, kImplemented);
+
+// The extra AV codecs are system modules from the optional media update that
+// xam loads on request and counts references to. Their images aren't
+// available, so loading fails as when the module isn't on the console.
+constexpr X_HRESULT kExtraAVCodecsNotFound =
+    X_HRESULT_FROM_NT(X_STATUS_OBJECT_NAME_NOT_FOUND);
+constexpr X_HRESULT kErrorPointer = 0x80004003;
+
+dword_result_t XamLoadExtraAVCodecs2_entry(lpdword_t module_handle_ptr) {
+  if (!module_handle_ptr) {
+    return kErrorPointer;
+  }
+  *module_handle_ptr = 0;
+  return kExtraAVCodecsNotFound;
+}
+DECLARE_XAM_EXPORT1(XamLoadExtraAVCodecs2, kNone, kStub);
+
+void XamUnloadExtraAVCodecs2_entry() {
+  // Nothing was loaded.
+}
+DECLARE_XAM_EXPORT1(XamUnloadExtraAVCodecs2, kNone, kStub);
+
+void XamGetDashBackstackNodesCount_entry() {
+  // On the 17559 xam this ordinal (0x7DD) is the unload that pairs with 0x7DC,
+  // like the 0x7E3/0x7E4 extra codecs pair: no arguments, and npctrl calls it
+  // to drop the first extra codecs module. Nothing was loaded, so there is
+  // nothing to drop.
+}
+DECLARE_XAM_EXPORT1(XamGetDashBackstackNodesCount, kNone, kSketchy);
 
 }  // namespace xam
 }  // namespace kernel
