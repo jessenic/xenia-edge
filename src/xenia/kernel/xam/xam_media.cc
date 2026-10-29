@@ -92,11 +92,10 @@ dword_result_t XamGetClosedCaptioningSettings_entry(lpdword_t settings_ptr) {
 }
 DECLARE_XAM_EXPORT1(XamGetClosedCaptioningSettings, kNone, kImplemented);
 
-// The extra AV codecs are system modules from the optional media update that
-// xam loads on request and counts references to. Their images aren't
-// available, so loading fails as when the module isn't on the console.
-constexpr X_HRESULT kExtraAVCodecsNotFound =
-    X_HRESULT_FROM_NT(X_STATUS_OBJECT_NAME_NOT_FOUND);
+// The extra AV codecs are system modules that xam loads on request and counts
+// references to. The handle it returns is the module's entry point. Their
+// images aren't available, so loading succeeds with no module, which npctrl
+// takes as there being no extra codecs. It doesn't recover from a failure.
 constexpr X_HRESULT kErrorPointer = 0x80004003;
 
 // Two codec modules share one loader: ordinals 0x7DC/0x7DD load and unload the
@@ -106,7 +105,7 @@ static dword_result_t LoadExtraAVCodecs(lpdword_t module_handle_ptr) {
     return kErrorPointer;
   }
   *module_handle_ptr = 0;
-  return kExtraAVCodecsNotFound;
+  return X_E_SUCCESS;
 }
 
 dword_result_t XamLoadExtraAVCodecs_entry(lpdword_t module_handle_ptr) {
