@@ -12,15 +12,21 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_private.h"
@@ -29,8 +35,10 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xevent.h"
+#include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xsocket.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/vfs/virtual_file_system.h"
 #include "xenia/xbox.h"
 
 #ifdef XE_PLATFORM_WIN32
@@ -521,6 +529,171 @@ dword_result_t NetDll_WSASendTo_entry(
   return 0;
 }
 DECLARE_XAM_EXPORT1(NetDll_WSASendTo, kNetworking, kImplemented);
+
+// Finishes an overlapped operation that completed at once, the way the I/O
+// thread finishes a pending one: count and flags first, then internal, then
+// the event.
+static void CompleteOverlappedNow(XWSAOVERLAPPED* overlapped, uint32_t bytes,
+                                  uint32_t flags) {
+  overlapped->internal_high = bytes;
+  overlapped->offset.low = flags;
+  std::atomic_thread_fence(std::memory_order_release);
+  overlapped->internal = 0;
+  if (overlapped->event_handle) {
+    if (auto event = kernel_state()->object_table()->LookupObject<XEvent>(
+            overlapped->event_handle)) {
+      event->Set(0, false);
+    }
+  }
+}
+
+// WSARecv on a connected or bound socket. An overlapped receive on a System
+// Link datagram socket pends like WSARecvFrom's. Any other socket receives
+// right away and completes the overlapped before returning, which Winsock
+// allows for an operation that finishes immediately.
+dword_result_t NetDll_WSARecv_entry(
+    dword_t caller, dword_t socket_handle, pointer_t<XWSABUF> buffers_ptr,
+    dword_t buffer_count, lpdword_t num_bytes_recv, lpdword_t flags_ptr,
+    pointer_t<XWSAOVERLAPPED> overlapped_ptr, lpvoid_t completion_routine_ptr) {
+  auto socket =
+      kernel_state()->object_table()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAENOTSOCK));
+    return -1;
+  }
+  if (!buffers_ptr || !buffer_count) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAEINVAL));
+    return -1;
+  }
+  if (completion_routine_ptr) {
+    XELOGW("NetDll_WSARecv: completion routines are not supported");
+  }
+  const uint32_t flags = flags_ptr ? flags_ptr.value() : 0;
+
+  std::vector<std::span<uint8_t>> buffers;
+  size_t total = 0;
+  for (uint32_t i = 0; i < buffer_count; ++i) {
+    buffers.emplace_back(
+        kernel_memory()->TranslateVirtual<uint8_t*>(buffers_ptr[i].buf_ptr),
+        static_cast<uint32_t>(buffers_ptr[i].len));
+    total += buffers_ptr[i].len;
+  }
+
+  if (overlapped_ptr) {
+    const int received =
+        socket->WSARecvFrom(buffers, flags, nullptr, nullptr, overlapped_ptr);
+    if (received >= 0) {
+      CompleteOverlappedNow(overlapped_ptr, uint32_t(received), 0);
+      if (num_bytes_recv) {
+        *num_bytes_recv = uint32_t(received);
+      }
+      if (flags_ptr) {
+        *flags_ptr = 0;
+      }
+      return 0;
+    }
+    const uint32_t error = socket->GetLastWSAError();
+    // Only System Link datagram sockets can pend. The rest fall through to an
+    // immediate receive.
+    if (error != 10045 /* WSAEOPNOTSUPP */ &&
+        error != uint32_t(X_WSAError::X_WSAEINVAL)) {
+      XThread::SetLastError(error);
+      return -1;
+    }
+  }
+
+  std::vector<uint8_t> data(total);
+  const int received =
+      socket->Recv(data.data(), static_cast<uint32_t>(total), flags);
+  if (received < 0) {
+    XThread::SetLastError(socket->GetLastWSAError());
+    return -1;
+  }
+  size_t offset = 0;
+  for (auto& buffer : buffers) {
+    if (offset >= size_t(received)) {
+      break;
+    }
+    const size_t count = std::min(buffer.size(), size_t(received) - offset);
+    std::memcpy(buffer.data(), data.data() + offset, count);
+    offset += count;
+  }
+  if (num_bytes_recv) {
+    *num_bytes_recv = uint32_t(received);
+  }
+  if (flags_ptr) {
+    *flags_ptr = 0;
+  }
+  if (overlapped_ptr) {
+    CompleteOverlappedNow(overlapped_ptr, uint32_t(received), 0);
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_WSARecv, kNetworking, kImplemented);
+
+// WSASend on a connected socket. The send completes before returning, so an
+// overlapped one is completed right away.
+dword_result_t NetDll_WSASend_entry(dword_t caller, dword_t socket_handle,
+                                    pointer_t<XWSABUF> buffers_ptr,
+                                    dword_t buffer_count,
+                                    lpdword_t num_bytes_sent, dword_t flags,
+                                    pointer_t<XWSAOVERLAPPED> overlapped_ptr,
+                                    lpvoid_t completion_routine_ptr) {
+  auto socket =
+      kernel_state()->object_table()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAENOTSOCK));
+    return -1;
+  }
+  if (!buffers_ptr && buffer_count) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAEFAULT));
+    return -1;
+  }
+  if (completion_routine_ptr) {
+    XELOGW("NetDll_WSASend: completion routines are not supported");
+  }
+
+  // The socket takes one buffer, so the guest's are gathered first.
+  std::vector<uint8_t> data;
+  for (uint32_t i = 0; i < buffer_count; ++i) {
+    const uint32_t length = buffers_ptr[i].len;
+    if (!length) {
+      continue;
+    }
+    const uint8_t* source = kernel_memory()->TranslateVirtual<const uint8_t*>(
+        buffers_ptr[i].buf_ptr);
+    data.insert(data.end(), source, source + length);
+  }
+  const int sent =
+      socket->Send(data.data(), static_cast<uint32_t>(data.size()), flags);
+  if (sent < 0) {
+    XThread::SetLastError(socket->GetLastWSAError());
+    return -1;
+  }
+  if (num_bytes_sent) {
+    *num_bytes_sent = uint32_t(sent);
+  }
+  if (overlapped_ptr) {
+    CompleteOverlappedNow(overlapped_ptr, uint32_t(sent), 0);
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_WSASend, kNetworking, kImplemented);
+
+// Every overlapped operation either pends on the System Link I/O thread, which
+// a close cancels, or has completed before its call returned. There is nothing
+// else in flight to cancel here.
+dword_result_t NetDll_WSACancelOverlappedIO_entry(dword_t caller,
+                                                  dword_t socket_handle) {
+  auto socket =
+      kernel_state()->object_table()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAENOTSOCK));
+    return -1;
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_WSACancelOverlappedIO, kNetworking, kSketchy);
 
 dword_result_t NetDll_WSAWaitForMultipleEvents_entry(dword_t num_events,
                                                      lpdword_t events,
@@ -1110,6 +1283,56 @@ dword_result_t XampXAuthGetTitleBuffer_entry() {
 }
 DECLARE_XAM_EXPORT1(XampXAuthGetTitleBuffer, kNetworking, kStub);
 
+// Whether the title may use plain sockets to local hosts. xam requires one of
+// the title's insecure socket privileges, then consults a console setting
+// that lists titles to refuse. That setting is empty on a retail console.
+dword_result_t XampXAuthIsLocalSocketAllowed_entry() {
+  auto module = kernel_state()->GetExecutableModule();
+  if (!module) {
+    return 0;
+  }
+  // Privileges 6 and 45, as bits of the two system flag headers. Both headers
+  // hold their value inline.
+  constexpr uint32_t kInsecureSockets = 1u << 6;
+  constexpr uint32_t kInsecureLocalSockets = 1u << (45 - 32);
+  uint32_t flags = 0;
+  module->GetOptHeader(XEX_HEADER_SYSTEM_FLAGS, &flags);
+  if (flags & kInsecureSockets) {
+    return 1;
+  }
+  uint32_t flags_32 = 0;
+  module->GetOptHeader(XEX_HEADER_SYSTEM_FLAGS_32, &flags_32);
+  return (flags_32 & kInsecureLocalSockets) ? 1 : 0;
+}
+DECLARE_XAM_EXPORT1(XampXAuthIsLocalSocketAllowed, kNetworking, kSketchy);
+
+// Opens the raw partition that backs the title URL cache. The size is left 0
+// as xam does. Returns 0, or 0x8002 when the partition can't be opened.
+dword_result_t CurlOpenTitleBackingFile_entry(lpdword_t handle_out,
+                                              lpqword_t size_out) {
+  if (size_out) {
+    *size_out = 0;
+  }
+  if (!handle_out) {
+    return 0x8002;
+  }
+  *handle_out = 0;
+  vfs::File* vfs_file = nullptr;
+  vfs::FileAction file_action;
+  const X_STATUS result = kernel_state()->file_system()->OpenFile(
+      nullptr, "\\Device\\Harddisk0\\TitleURLCachePartition",
+      vfs::FileDisposition::kOpen, 0xC0000000, false, true, &vfs_file,
+      &file_action);
+  if (XFAILED(result)) {
+    return 0x8002;
+  }
+  auto file =
+      object_ref<XFile>(new XFile(kernel_state(), vfs_file, true, false, true));
+  *handle_out = file->handle();
+  return 0;
+}
+DECLARE_XAM_EXPORT1(CurlOpenTitleBackingFile, kNetworking, kImplemented);
+
 dword_result_t NetDll_XHttpStartup_entry(dword_t caller, dword_t reserved,
                                          dword_t reserved_ptr,
                                          const ppc_context_t& ctx) {
@@ -1137,21 +1360,6 @@ dword_result_t NetDll_XHttpShutdown_entry(dword_t caller) {
   return 1;
 }
 DECLARE_XAM_EXPORT1(NetDll_XHttpShutdown, kNetworking, kStub);
-
-dword_result_t NetDll_XHttpOpen_entry(dword_t caller, lpstring_t user_agent,
-                                      dword_t access_type,
-                                      lpstring_t proxy_name,
-                                      lpstring_t proxy_bypass, dword_t flags) {
-  // retrieves xhttp directly from array X_HTTP_OBJECT_PTR_ARRAY[xnc]
-  if ((access_type != 0 && access_type != 1 && access_type != 3) ||
-      proxy_bypass) {
-    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
-  }
-
-  XThread::SetLastError(X_ERROR_NOT_SUPPORTED);  // Until properly implemented
-  return 0;
-}
-DECLARE_XAM_EXPORT1(NetDll_XHttpOpen, kNetworking, kStub);
 
 dword_result_t NetDll_socket_entry(dword_t caller, dword_t af, dword_t type,
                                    dword_t protocol) {
@@ -1868,6 +2076,178 @@ dword_result_t NetDll_XNetUnregisterInAddr_entry(dword_t caller,
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetUnregisterInAddr, kNetworking, kImplemented);
 
+// Moves a registered key to a new key ID, keeping its exchange key.
+dword_result_t NetDll_XNetReplaceKey_entry(dword_t caller,
+                                           lpvoid_t unregister_key_id,
+                                           lpvoid_t replace_key_id) {
+  auto link = GetSystemLink(kernel_state());
+  if (!link) {
+    return 0;
+  }
+  if (!unregister_key_id || !replace_key_id) {
+    return uint32_t(X_WSAError::X_WSAEFAULT);
+  }
+  net::KeyId old_id, new_id;
+  std::memcpy(old_id.data(), unregister_key_id, old_id.size());
+  std::memcpy(new_id.data(), replace_key_id, new_id.size());
+  net::Key key;
+  if (!link->GetKey(old_id, key)) {
+    return uint32_t(X_WSAError::X_WSAEINVAL);
+  }
+  if (old_id == new_id) {
+    return 0;
+  }
+  if (const uint32_t result = link->UnregisterKey(old_id)) {
+    return result;
+  }
+  return link->RegisterKey(new_id, key);
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetReplaceKey, kNetworking, kSketchy);
+
+// There is no secure gateway to route a LIVE service through, so the server's
+// own address is the one to connect to.
+dword_result_t NetDll_XNetServerToInAddr_entry(dword_t caller, dword_t in_addr,
+                                               dword_t service_id,
+                                               lpdword_t in_addr_out) {
+  if (!in_addr_out) {
+    return uint32_t(X_WSAError::X_WSAEFAULT);
+  }
+  *in_addr_out = in_addr.value();
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetServerToInAddr, kNetworking, kSketchy);
+
+// The LIVE logon state xam reports. The caller only logs the 16 bytes it gets
+// back. Without a LIVE logon every field reads as zero.
+dword_result_t NetDll_XnpLogonGetStatus_entry(dword_t caller,
+                                              lpvoid_t status_ptr,
+                                              lpvoid_t extra_ptr) {
+  if (status_ptr) {
+    std::memset(status_ptr, 0, 0x10);
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XnpLogonGetStatus, kNetworking, kSketchy);
+
+// The network configuration status, a 0x3A-byte block xam fills from its own
+// state. Bit 0 of the first field flags a configuration that is not ready.
+dword_result_t NetDll_XnpGetConfigStatus_entry(dword_t caller,
+                                               lpvoid_t status_ptr) {
+  if (!status_ptr) {
+    return uint32_t(X_WSAError::X_WSAEFAULT);
+  }
+  std::memset(status_ptr, 0, 0x3A);
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XnpGetConfigStatus, kNetworking, kSketchy);
+
+// UPnP discovery. No UPnP devices answer on the emulated network, so a search
+// completes at once with none.
+constexpr uint32_t X_E_HANDLE = 0x80070006;
+constexpr uint32_t X_E_OUTOFMEMORY = 0x8007000E;
+
+struct UpnpState {
+  std::mutex mutex;
+  uint32_t starts = 0;
+  // Open search handles, guest blocks so the values look like xam's.
+  std::vector<uint32_t> searches;
+};
+
+static UpnpState& GetUpnpState() {
+  static UpnpState state;
+  return state;
+}
+
+dword_result_t NetDll_UpnpStartup_entry(dword_t caller) {
+  auto& state = GetUpnpState();
+  std::lock_guard lock(state.mutex);
+  ++state.starts;
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_UpnpStartup, kNetworking, kImplemented);
+
+dword_result_t NetDll_UpnpCleanup_entry(dword_t caller) {
+  auto& state = GetUpnpState();
+  std::lock_guard lock(state.mutex);
+  if (state.starts && !--state.starts) {
+    for (uint32_t search : state.searches) {
+      kernel_memory()->SystemHeapFree(search);
+    }
+    state.searches.clear();
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_UpnpCleanup, kNetworking, kImplemented);
+
+// The arguments between the search target and the handle are the device
+// limit, retry and timeout settings and the caller's context.
+dword_result_t NetDll_UpnpSearchCreate_entry(dword_t caller,
+                                             lpstring_t search_target,
+                                             dword_t max_devices,
+                                             dword_t retries, dword_t timeout,
+                                             dword_t arg5, dword_t context,
+                                             lpdword_t search_handle_ptr) {
+  auto& state = GetUpnpState();
+  std::lock_guard lock(state.mutex);
+  if (!state.starts || !search_handle_ptr) {
+    return X_E_HANDLE;
+  }
+  const uint32_t search = kernel_memory()->SystemHeapAlloc(4);
+  if (!search) {
+    return X_E_OUTOFMEMORY;
+  }
+  xe::store_and_swap<uint32_t>(kernel_memory()->TranslateVirtual(search), 1);
+  state.searches.push_back(search);
+  *search_handle_ptr = search;
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_UpnpSearchCreate, kNetworking, kStub);
+
+static bool IsUpnpSearch(uint32_t handle) {
+  auto& state = GetUpnpState();
+  return std::find(state.searches.begin(), state.searches.end(), handle) !=
+         state.searches.end();
+}
+
+// Copies the devices found into 0x194-byte entries. There are none.
+dword_result_t NetDll_UpnpSearchGetDevices_entry(dword_t caller,
+                                                 dword_t search_handle,
+                                                 lpvoid_t devices_ptr,
+                                                 lpdword_t count_ptr) {
+  auto& state = GetUpnpState();
+  std::lock_guard lock(state.mutex);
+  if (!IsUpnpSearch(search_handle)) {
+    return X_E_HANDLE;
+  }
+  if (count_ptr) {
+    *count_ptr = 0;
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_UpnpSearchGetDevices, kNetworking, kStub);
+
+dword_result_t NetDll_UpnpDoWork_entry(dword_t caller, dword_t handle,
+                                       dword_t max_wait_ms) {
+  auto& state = GetUpnpState();
+  std::lock_guard lock(state.mutex);
+  return IsUpnpSearch(handle) ? 0 : X_E_HANDLE;
+}
+DECLARE_XAM_EXPORT1(NetDll_UpnpDoWork, kNetworking, kStub);
+
+dword_result_t NetDll_UpnpCloseHandle_entry(dword_t caller, dword_t handle) {
+  auto& state = GetUpnpState();
+  std::lock_guard lock(state.mutex);
+  auto it =
+      std::find(state.searches.begin(), state.searches.end(), handle.value());
+  if (it == state.searches.end()) {
+    return X_E_HANDLE;
+  }
+  kernel_memory()->SystemHeapFree(*it);
+  state.searches.erase(it);
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_UpnpCloseHandle, kNetworking, kImplemented);
+
 // URL_COMPONENTSA with 32-bit guest pointers.
 struct X_URL_COMPONENTS {
   xe::be<uint32_t> struct_size;
@@ -1899,20 +2279,11 @@ enum X_INTERNET_SCHEME : uint32_t {
   X_INTERNET_SCHEME_HTTPS = 2,
 };
 
-dword_result_t NetDll_XHttpCrackUrl_entry(dword_t caller, lpvoid_t url_ptr,
-                                          dword_t url_length, dword_t flags,
-                                          pointer_t<X_URL_COMPONENTS> parts) {
-  // TODO(has207): ICU_DECODE and ICU_ESCAPE are accepted but not applied.
-  if (!url_ptr || !parts || parts->struct_size != sizeof(X_URL_COMPONENTS) ||
-      (flags & ~(X_ICU_DECODE | X_ICU_ESCAPE))) {
-    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
-    return 0;
-  }
-  // A length still stops at the first NUL.
-  const char* url = url_ptr.as<const char*>();
-  const std::string_view text(
-      url, url_length ? strnlen(url, url_length) : std::strlen(url));
-
+// Splits |text|, the URL as narrow characters, into |parts|. The URL itself is
+// at |url_address| in guest memory with |char_size|-byte characters, which is
+// where component pointers point and what component buffers get copied from.
+static uint32_t CrackUrl(std::string_view text, uint32_t url_address,
+                         uint32_t char_size, X_URL_COMPONENTS* parts) {
   const size_t scheme_end = text.find(':');
   if (scheme_end == std::string_view::npos) {
     XThread::SetLastError(X_ERROR_WINHTTP_UNRECOGNIZED_SCHEME);
@@ -2009,7 +2380,7 @@ dword_result_t NetDll_XHttpCrackUrl_entry(dword_t caller, lpvoid_t url_ptr,
       return;
     }
     if (!ptr) {
-      ptr = present ? url_ptr.guest_address() + uint32_t(offset) : 0;
+      ptr = present ? url_address + uint32_t(offset * char_size) : 0;
       length = present ? uint32_t(size) : 0;
       return;
     }
@@ -2018,9 +2389,12 @@ dword_result_t NetDll_XHttpCrackUrl_entry(dword_t caller, lpvoid_t url_ptr,
       insufficient = true;
       return;
     }
-    char* out = kernel_memory()->TranslateVirtual<char*>(ptr);
-    std::memcpy(out, url + offset, size);
-    out[size] = '\0';
+    uint8_t* out = kernel_memory()->TranslateVirtual<uint8_t*>(ptr);
+    std::memcpy(out,
+                kernel_memory()->TranslateVirtual<const uint8_t*>(
+                    url_address + uint32_t(offset * char_size)),
+                size * char_size);
+    std::memset(out + size * char_size, 0, char_size);
     length = uint32_t(size);
   };
   set(parts->scheme_ptr, parts->scheme_length, true, 0, scheme_end);
@@ -2042,7 +2416,588 @@ dword_result_t NetDll_XHttpCrackUrl_entry(dword_t caller, lpvoid_t url_ptr,
   }
   return 1;
 }
+
+dword_result_t NetDll_XHttpCrackUrl_entry(dword_t caller, lpvoid_t url_ptr,
+                                          dword_t url_length, dword_t flags,
+                                          pointer_t<X_URL_COMPONENTS> parts) {
+  // TODO(has207): ICU_DECODE and ICU_ESCAPE are accepted but not applied.
+  if (!url_ptr || !parts || parts->struct_size != sizeof(X_URL_COMPONENTS) ||
+      (flags & ~(X_ICU_DECODE | X_ICU_ESCAPE))) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  // A length still stops at the first NUL.
+  const char* url = url_ptr.as<const char*>();
+  const std::string_view text(
+      url, url_length ? strnlen(url, url_length) : std::strlen(url));
+  return CrackUrl(text, url_ptr.guest_address(), 1, parts);
+}
 DECLARE_XAM_EXPORT1(NetDll_XHttpCrackUrl, kNetworking, kImplemented);
+
+// The UTF-16 form. Lengths count characters and components are UTF-16 too.
+dword_result_t NetDll_XHttpCrackUrlW_entry(dword_t caller, lpvoid_t url_ptr,
+                                           dword_t url_length, dword_t flags,
+                                           pointer_t<X_URL_COMPONENTS> parts) {
+  if (!url_ptr || !parts || parts->struct_size != sizeof(X_URL_COMPONENTS) ||
+      (flags & ~(X_ICU_DECODE | X_ICU_ESCAPE))) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  // Parsed as one narrow character per UTF-16 unit so offsets carry over.
+  // Nothing outside ASCII is a delimiter, so such a unit becomes 0x80.
+  const auto* url = url_ptr.as<const xe::be<uint16_t>*>();
+  std::string text;
+  for (uint32_t i = 0; !url_length || i < url_length; ++i) {
+    const uint16_t c = url[i];
+    if (!c) {
+      break;
+    }
+    text.push_back(c < 0x80 ? char(c) : char(0x80));
+  }
+  return CrackUrl(text, url_ptr.guest_address(), 2, parts);
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpCrackUrlW, kNetworking, kImplemented);
+
+// XHttp is xam's always-asynchronous WinHTTP. Handles, options and status
+// callbacks work, but there is no HTTP stack behind them: a request fails to
+// send as if its server could not be reached. Callbacks run on the title's own
+// thread, from XHttpDoWork, except a closing handle's, which runs from
+// XHttpCloseHandle.
+
+constexpr uint32_t X_ERROR_WINHTTP_INVALID_OPTION = 12009;
+constexpr uint32_t X_ERROR_WINHTTP_INCORRECT_HANDLE_TYPE = 12018;
+constexpr uint32_t X_ERROR_WINHTTP_INCORRECT_HANDLE_STATE = 12019;
+constexpr uint32_t X_ERROR_WINHTTP_CANNOT_CONNECT = 12029;
+
+// XHttpOpen requires the async flag. XHttpConnect's secure flag picks 443.
+constexpr uint32_t kXHttpFlagAsync = 0x10000000;
+constexpr uint32_t kXHttpFlagSecure = 0x00800000;
+constexpr uint32_t kXHttpConnectFlags = 0x00C00003;
+
+// Status codes, which double as notification flag bits.
+constexpr uint32_t kXHttpStatusHandleClosing = 0x00000800;
+constexpr uint32_t kXHttpStatusRequestError = 0x00200000;
+// The API a request error reports as failing.
+constexpr uint32_t kXHttpApiSendRequest = 5;
+
+constexpr uint32_t kXHttpOptionCallback = 1;
+constexpr uint32_t kXHttpOptionContextValue = 45;
+
+// A request's own buffer must hold xam's request state.
+constexpr uint32_t kXHttpRequestMemoryMin = 0x5D0;
+
+enum class XHttpType : uint32_t { kRequest = 1, kConnect = 2, kSession = 3 };
+
+// Each handle is a small guest block, so the title holds an address as it does
+// with xam. +0 holds the type, +4 the handle itself (what a closing
+// notification points at) and +8 the result a request error points at.
+constexpr uint32_t kXHttpBlockSize = 0x10;
+
+struct XHttpHandle {
+  XHttpType type;
+  uint32_t parent = 0;
+  uint32_t session = 0;
+  uint32_t callback = 0;
+  uint32_t notify_flags = 0;
+  uint32_t context = 0;
+  // A connect handle's server and its one open request.
+  std::string server;
+  uint16_t port = 0;
+  uint32_t open_request = 0;
+  // A request handle sends once.
+  bool sent = false;
+  std::map<uint32_t, std::vector<uint8_t>> options;
+};
+
+struct XHttpNotification {
+  uint32_t handle;
+  uint32_t callback;
+  uint32_t context;
+  uint32_t status;
+  uint32_t info;
+  uint32_t info_length;
+};
+
+struct XHttpState {
+  std::mutex mutex;
+  std::unordered_map<uint32_t, XHttpHandle> handles;
+  // What each session's next XHttpDoWork delivers.
+  std::unordered_map<uint32_t, std::deque<XHttpNotification>> pending;
+};
+
+static XHttpState& GetXHttpState() {
+  static XHttpState state;
+  return state;
+}
+
+// Looks up a handle of |type|. Sets the error for a missing one or another
+// type.
+static XHttpHandle* FindXHttpHandle(XHttpState& state, uint32_t handle,
+                                    XHttpType type) {
+  auto it = state.handles.find(handle);
+  if (it == state.handles.end() || it->second.type != type) {
+    XThread::SetLastError(X_ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+    return nullptr;
+  }
+  return &it->second;
+}
+
+// Creates a handle under |parent|, whose callback it inherits.
+static uint32_t CreateXHttpHandle(XHttpState& state, XHttpType type,
+                                  uint32_t parent) {
+  const uint32_t block = kernel_memory()->SystemHeapAlloc(kXHttpBlockSize);
+  if (!block) {
+    XThread::SetLastError(X_ERROR_NOT_ENOUGH_MEMORY);
+    return 0;
+  }
+  uint8_t* data = kernel_memory()->TranslateVirtual<uint8_t*>(block);
+  std::memset(data, 0, kXHttpBlockSize);
+  xe::store_and_swap<uint32_t>(data + 0, uint32_t(type));
+  xe::store_and_swap<uint32_t>(data + 4, block);
+  XHttpHandle handle;
+  handle.type = type;
+  handle.parent = parent;
+  handle.session = block;
+  if (parent) {
+    const XHttpHandle& owner = state.handles.at(parent);
+    handle.session = owner.session;
+    handle.callback = owner.callback;
+    handle.notify_flags = owner.notify_flags;
+  }
+  state.handles.emplace(block, std::move(handle));
+  return block;
+}
+
+// Closes |handle| and every handle under it, children first. Their pending
+// notifications are dropped and closing ones are added to |closing|.
+static void CloseXHttpHandle(XHttpState& state, uint32_t handle,
+                             std::vector<XHttpNotification>& closing) {
+  std::vector<uint32_t> children;
+  for (const auto& [child, child_entry] : state.handles) {
+    if (child_entry.parent == handle) {
+      children.push_back(child);
+    }
+  }
+  for (uint32_t child : children) {
+    CloseXHttpHandle(state, child, closing);
+  }
+
+  auto it = state.handles.find(handle);
+  if (it == state.handles.end()) {
+    return;
+  }
+  const XHttpHandle entry = std::move(it->second);
+  state.handles.erase(it);
+  if (entry.type == XHttpType::kSession) {
+    state.pending.erase(handle);
+  } else if (auto queue = state.pending.find(entry.session);
+             queue != state.pending.end()) {
+    std::erase_if(queue->second, [&](const XHttpNotification& notification) {
+      return notification.handle == handle;
+    });
+  }
+  if (entry.type == XHttpType::kRequest) {
+    if (auto connect = state.handles.find(entry.parent);
+        connect != state.handles.end() &&
+        connect->second.open_request == handle) {
+      connect->second.open_request = 0;
+    }
+  }
+  if (entry.callback && (entry.notify_flags & kXHttpStatusHandleClosing)) {
+    closing.push_back({handle, entry.callback, entry.context,
+                       kXHttpStatusHandleClosing, handle + 4, 4});
+  } else {
+    kernel_memory()->SystemHeapFree(handle);
+  }
+}
+
+// Calls the title's status callbacks, without the lock held since they may
+// call back in. A closing handle's block is freed once its callback returns.
+static void RunXHttpCallbacks(
+    const std::vector<XHttpNotification>& notifications) {
+  auto thread = XThread::GetCurrentThread();
+  for (const auto& notification : notifications) {
+    const bool closing = notification.status == kXHttpStatusHandleClosing;
+    if (!closing) {
+      // An earlier callback may have closed this handle.
+      auto& state = GetXHttpState();
+      std::lock_guard lock(state.mutex);
+      if (!state.handles.contains(notification.handle)) {
+        continue;
+      }
+    }
+    if (thread) {
+      uint64_t args[] = {notification.handle, notification.context,
+                         notification.status, notification.info,
+                         notification.info_length};
+      kernel_state()->processor()->Execute(
+          thread->thread_state(), notification.callback, args, std::size(args));
+    }
+    if (closing) {
+      kernel_memory()->SystemHeapFree(notification.handle);
+    }
+  }
+}
+
+dword_result_t NetDll_XHttpOpen_entry(dword_t caller, lpstring_t user_agent,
+                                      dword_t access_type,
+                                      lpstring_t proxy_name,
+                                      lpstring_t proxy_bypass, dword_t flags) {
+  if ((access_type != 0 && access_type != 1 && access_type != 3) ||
+      proxy_bypass || (flags & ~kXHttpFlagAsync) ||
+      !(flags & kXHttpFlagAsync)) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  const uint32_t session = CreateXHttpHandle(state, XHttpType::kSession, 0);
+  if (session) {
+    XThread::SetLastError(X_ERROR_SUCCESS);
+  }
+  return session;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpOpen, kNetworking, kImplemented);
+
+dword_result_t NetDll_XHttpConnect_entry(dword_t caller, dword_t session,
+                                         lpvoid_t server_name_ptr, word_t port,
+                                         dword_t flags) {
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  if (!FindXHttpHandle(state, session, XHttpType::kSession)) {
+    return 0;
+  }
+  const char* server_name = server_name_ptr.as<const char*>();
+  const size_t length = server_name ? strnlen(server_name, 0x100) : 0;
+  if (!length || length >= 0x100 || (flags & ~kXHttpConnectFlags)) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  const uint32_t connect =
+      CreateXHttpHandle(state, XHttpType::kConnect, session);
+  if (!connect) {
+    return 0;
+  }
+  XHttpHandle& entry = state.handles.at(connect);
+  entry.server.assign(server_name, length);
+  entry.port = port.value() ? port.value()
+                            : uint16_t((flags & kXHttpFlagSecure) ? 443 : 80);
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return connect;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpConnect, kNetworking, kImplemented);
+
+// A connection carries one request at a time. A title's own request buffer is
+// only checked for size since nothing is kept in it.
+static uint32_t OpenXHttpRequest(uint32_t connect, lpvoid_t object_name_ptr,
+                                 uint32_t memory, uint32_t memory_size) {
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  XHttpHandle* owner = FindXHttpHandle(state, connect, XHttpType::kConnect);
+  if (!owner) {
+    return 0;
+  }
+  if (owner->open_request) {
+    XThread::SetLastError(X_ERROR_ALREADY_EXISTS);
+    return 0;
+  }
+  if (!object_name_ptr || (!memory && memory_size) ||
+      (memory && memory_size < kXHttpRequestMemoryMin)) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  if (*object_name_ptr.as<const char*>() != '/') {
+    XThread::SetLastError(X_ERROR_WINHTTP_UNRECOGNIZED_SCHEME);
+    return 0;
+  }
+  const uint32_t request =
+      CreateXHttpHandle(state, XHttpType::kRequest, connect);
+  if (!request) {
+    return 0;
+  }
+  state.handles.at(connect).open_request = request;
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return request;
+}
+
+dword_result_t NetDll_XHttpOpenRequest_entry(
+    dword_t caller, dword_t connect, lpstring_t verb, lpvoid_t object_name,
+    lpstring_t version, lpstring_t referrer, lpvoid_t accept_types,
+    dword_t flags) {
+  return OpenXHttpRequest(connect, object_name, 0, 0);
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpOpenRequest, kNetworking, kImplemented);
+
+dword_result_t NetDll_XHttpOpenRequestUsingMemory_entry(
+    dword_t caller, dword_t connect, lpstring_t verb, lpvoid_t object_name,
+    lpstring_t version, lpstring_t referrer, lpvoid_t accept_types,
+    lpvoid_t memory, dword_t memory_size, dword_t flags) {
+  return OpenXHttpRequest(connect, object_name, memory.guest_address(),
+                          memory_size);
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpOpenRequestUsingMemory, kNetworking,
+                    kImplemented);
+
+dword_result_t NetDll_XHttpCloseHandle_entry(dword_t caller, dword_t handle) {
+  std::vector<XHttpNotification> closing;
+  {
+    auto& state = GetXHttpState();
+    std::lock_guard lock(state.mutex);
+    if (!state.handles.contains(handle)) {
+      XThread::SetLastError(X_ERROR_INVALID_HANDLE);
+      return 0;
+    }
+    CloseXHttpHandle(state, handle, closing);
+  }
+  RunXHttpCallbacks(closing);
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpCloseHandle, kNetworking, kImplemented);
+
+// Returns the callback it replaces. Handles opened later under this one start
+// with the new callback.
+dword_result_t NetDll_XHttpSetStatusCallback_entry(dword_t caller,
+                                                   dword_t handle,
+                                                   dword_t callback,
+                                                   dword_t notify_flags,
+                                                   dword_t reserved) {
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  auto it = state.handles.find(handle);
+  if (it == state.handles.end()) {
+    XThread::SetLastError(X_ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+    return 0;
+  }
+  const uint32_t previous = it->second.callback;
+  it->second.callback = callback;
+  it->second.notify_flags = notify_flags;
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return previous;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpSetStatusCallback, kNetworking, kImplemented);
+
+// Delivers the session's pending notifications. With none, a nonzero wait
+// gives up a little time so a title polling in a loop doesn't spin.
+dword_result_t NetDll_XHttpDoWork_entry(dword_t caller, dword_t session,
+                                        dword_t max_wait_ms) {
+  std::vector<XHttpNotification> notifications;
+  {
+    auto& state = GetXHttpState();
+    std::lock_guard lock(state.mutex);
+    if (!FindXHttpHandle(state, session, XHttpType::kSession)) {
+      return 0;
+    }
+    if (auto it = state.pending.find(session); it != state.pending.end()) {
+      notifications.assign(it->second.begin(), it->second.end());
+      state.pending.erase(it);
+    }
+  }
+  if (notifications.empty() && max_wait_ms) {
+    if (auto thread = XThread::GetCurrentThread()) {
+      const uint32_t wait_ms = std::min<uint32_t>(max_wait_ms, 10);
+      thread->Delay(0, 0, uint64_t(-int64_t(wait_ms) * 10000));
+    }
+  }
+  RunXHttpCallbacks(notifications);
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpDoWork, kNetworking, kImplemented);
+
+// The request never reaches a server. With a callback that takes request
+// errors, the send is accepted and the error arrives from the next
+// XHttpDoWork, as a refused connection would. Otherwise it fails here.
+dword_result_t NetDll_XHttpSendRequest_entry(
+    dword_t caller, dword_t request, lpvoid_t headers, dword_t headers_length,
+    lpvoid_t optional, dword_t optional_length, dword_t total_length,
+    dword_t context) {
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  XHttpHandle* entry = FindXHttpHandle(state, request, XHttpType::kRequest);
+  if (!entry) {
+    return 0;
+  }
+  if (entry->sent) {
+    XThread::SetLastError(X_ERROR_WINHTTP_INCORRECT_HANDLE_STATE);
+    return 0;
+  }
+  entry->sent = true;
+  entry->context = context;
+  const XHttpHandle& connect = state.handles.at(entry->parent);
+  XELOGI("NetDll_XHttpSendRequest: {}:{} is unreachable", connect.server,
+         connect.port);
+  if (!entry->callback || !(entry->notify_flags & kXHttpStatusRequestError)) {
+    XThread::SetLastError(X_ERROR_WINHTTP_CANNOT_CONNECT);
+    return 0;
+  }
+  uint8_t* result = kernel_memory()->TranslateVirtual<uint8_t*>(request + 8);
+  xe::store_and_swap<uint32_t>(result + 0, kXHttpApiSendRequest);
+  xe::store_and_swap<uint32_t>(result + 4, X_ERROR_WINHTTP_CANNOT_CONNECT);
+  state.pending[entry->session].push_back(
+      {request, entry->callback, entry->context, kXHttpStatusRequestError,
+       request + 8, 8});
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpSendRequest, kNetworking, kStub);
+
+// The calls that need a response. A request never gets one.
+static uint32_t FailXHttpResponseCall(uint32_t request) {
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  if (FindXHttpHandle(state, request, XHttpType::kRequest)) {
+    XThread::SetLastError(X_ERROR_WINHTTP_INCORRECT_HANDLE_STATE);
+  }
+  return 0;
+}
+
+dword_result_t NetDll_XHttpReceiveResponse_entry(dword_t caller,
+                                                 dword_t request,
+                                                 lpvoid_t reserved) {
+  return FailXHttpResponseCall(request);
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpReceiveResponse, kNetworking, kStub);
+
+dword_result_t NetDll_XHttpQueryHeaders_entry(dword_t caller, dword_t request,
+                                              dword_t info_level, lpvoid_t name,
+                                              lpvoid_t buffer,
+                                              lpdword_t buffer_length_ptr,
+                                              lpdword_t index_ptr) {
+  if (!buffer_length_ptr || (*buffer_length_ptr && !buffer)) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  return FailXHttpResponseCall(request);
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpQueryHeaders, kNetworking, kStub);
+
+// The count read arrives with the read-complete notification, so the last
+// argument goes unused as on the console.
+dword_result_t NetDll_XHttpReadData_entry(dword_t caller, dword_t request,
+                                          lpvoid_t buffer, dword_t length,
+                                          lpdword_t bytes_read_ptr) {
+  return FailXHttpResponseCall(request);
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpReadData, kNetworking, kStub);
+
+dword_result_t NetDll_XHttpWriteData_entry(dword_t caller, dword_t request,
+                                           lpvoid_t buffer, dword_t length,
+                                           lpdword_t bytes_written_ptr) {
+  return FailXHttpResponseCall(request);
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpWriteData, kNetworking, kStub);
+
+dword_result_t NetDll_XHttpQueryAuthSchemes_entry(
+    dword_t caller, dword_t request, lpdword_t supported_schemes_ptr,
+    lpdword_t first_scheme_ptr, lpdword_t auth_target_ptr) {
+  return FailXHttpResponseCall(request);
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpQueryAuthSchemes, kNetworking, kStub);
+
+// Credentials can be given ahead of any challenge. Nothing will use them.
+dword_result_t NetDll_XHttpSetCredentials_entry(
+    dword_t caller, dword_t request, dword_t auth_targets, dword_t auth_scheme,
+    lpvoid_t user_name, lpvoid_t password, lpvoid_t auth_params) {
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  if (!FindXHttpHandle(state, request, XHttpType::kRequest)) {
+    return 0;
+  }
+  if (!user_name) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpSetCredentials, kNetworking, kStub);
+
+// Options are kept per handle and read back as set. The callback and context
+// value are the handle's own.
+dword_result_t NetDll_XHttpQueryOption_entry(dword_t caller, dword_t handle,
+                                             dword_t option, lpvoid_t buffer,
+                                             lpdword_t buffer_length_ptr) {
+  if (!buffer_length_ptr || (*buffer_length_ptr && !buffer)) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  auto it = state.handles.find(handle);
+  if (it == state.handles.end()) {
+    XThread::SetLastError(X_ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+    return 0;
+  }
+  const XHttpHandle& entry = it->second;
+  std::vector<uint8_t> value;
+  if (option == kXHttpOptionCallback || option == kXHttpOptionContextValue) {
+    value.resize(4);
+    xe::store_and_swap<uint32_t>(value.data(), option == kXHttpOptionCallback
+                                                   ? entry.callback
+                                                   : entry.context);
+  } else if (auto stored = entry.options.find(option);
+             stored != entry.options.end()) {
+    value = stored->second;
+  } else {
+    XThread::SetLastError(X_ERROR_WINHTTP_INVALID_OPTION);
+    return 0;
+  }
+  if (*buffer_length_ptr < value.size()) {
+    *buffer_length_ptr = uint32_t(value.size());
+    XThread::SetLastError(X_ERROR_INSUFFICIENT_BUFFER);
+    return 0;
+  }
+  std::memcpy(buffer, value.data(), value.size());
+  *buffer_length_ptr = uint32_t(value.size());
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpQueryOption, kNetworking, kSketchy);
+
+// A null handle sets a global option, which nothing reads.
+dword_result_t NetDll_XHttpSetOption_entry(dword_t caller, dword_t handle,
+                                           dword_t option, lpvoid_t buffer,
+                                           dword_t buffer_length) {
+  if (!buffer && buffer_length) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  if (!handle) {
+    XThread::SetLastError(X_ERROR_SUCCESS);
+    return 1;
+  }
+  auto& state = GetXHttpState();
+  std::lock_guard lock(state.mutex);
+  auto it = state.handles.find(handle);
+  if (it == state.handles.end()) {
+    XThread::SetLastError(X_ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+    return 0;
+  }
+  XHttpHandle& entry = it->second;
+  if (option == kXHttpOptionContextValue && buffer_length >= 4) {
+    entry.context = xe::load_and_swap<uint32_t>(buffer);
+  }
+  const uint8_t* data = buffer.as<const uint8_t*>();
+  const uint32_t length = std::min<uint32_t>(buffer_length, 0x1000);
+  entry.options[option].assign(data, data + length);
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpSetOption, kNetworking, kImplemented);
+
+// Nothing is ever transferred, so every counter is 0.
+dword_result_t NetDll_XHttpGetPerfCounters_entry(
+    dword_t caller, pointer_t<X_PERFORMANCE_COUNTERS> counters) {
+  if (!counters) {
+    XThread::SetLastError(X_ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  counters.Zero();
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpGetPerfCounters, kNetworking, kStub);
 
 }  // namespace xam
 }  // namespace kernel
