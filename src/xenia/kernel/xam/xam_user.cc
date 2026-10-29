@@ -969,48 +969,51 @@ dword_result_t XamReadTileToTexture_entry(dword_t tile_type, dword_t title_id,
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  size_t buffer_size = size_t(stride) * size_t(tile_height);
-
+  // Tiles looked up by key, such as a gamer picture, pass XUSER_INDEX_NONE
+  // (0xFE) rather than a signed in user, so a missing user isn't an error.
+  // A tile that can't be found leaves the texture untouched, but the call
+  // still completes so a caller waiting on the overlapped isn't stuck.
   auto user = kernel_state()->xam_state()->GetUserProfile(user_index);
-  if (!user) {
-    return X_ERROR_INVALID_PARAMETER;
+
+  std::span<const uint8_t> tile;
+  if (user) {
+    tile = kernel_state()->xam_state()->user_tracker()->GetIcon(
+        user->xuid(), title_id, static_cast<XTileType>(tile_type.value()),
+        tile_id);
   }
 
-  std::span<const uint8_t> tile =
-      kernel_state()->xam_state()->user_tracker()->GetIcon(
-          user->xuid(), title_id, static_cast<XTileType>(tile_type.value()),
-          tile_id);
-
-  if (tile.empty()) {
-    return X_ERROR_SUCCESS;
-  }
-
-  int width, height, channels;
+  int width = 0, height = 0, channels = 0;
   unsigned char* imageData =
-      stbi_load_from_memory(tile.data(), static_cast<int>(tile.size()), &width,
-                            &height, &channels, STBI_rgb_alpha);
+      tile.empty()
+          ? nullptr
+          : stbi_load_from_memory(tile.data(), static_cast<int>(tile.size()),
+                                  &width, &height, &channels, STBI_rgb_alpha);
 
-  size_t icon_dimmension_size = width * height;
-  std::fill_n(reinterpret_cast<uint8_t*>(buffer_ptr.host_address()),
-              icon_dimmension_size * sizeof(uint32_t), 0);
+  if (imageData) {
+    const size_t icon_dimmension_size = size_t(width) * size_t(height);
+    for (size_t i = 0; i < icon_dimmension_size; i++) {
+      unsigned char* pixel = &imageData[i * sizeof(uint32_t)];
 
-  for (int i = 0; i < icon_dimmension_size; i++) {
-    unsigned char* pixel = &imageData[i * sizeof(uint32_t)];
+      // RGBA to ARGB. TODO: Find faster method!
+      // RGBA->AGBR
+      std::swap(pixel[0], pixel[3]);
+      // AGBR->ARBG
+      std::swap(pixel[1], pixel[3]);
+      // ARBG->ARGB
+      std::swap(pixel[2], pixel[3]);
+    }
 
-    // RGBA to ARGB. TODO: Find faster method!
-    // RGBA->AGBR
-    std::swap(pixel[0], pixel[3]);
-    // AGBR->ARBG
-    std::swap(pixel[1], pixel[3]);
-    // ARBG->ARGB
-    std::swap(pixel[2], pixel[3]);
+    const uint32_t row_size = std::min<uint32_t>(
+        stride, uint32_t(width) * uint32_t(sizeof(uint32_t)));
+    const uint32_t rows = std::min<uint32_t>(tile_height, uint32_t(height));
+    auto dest = reinterpret_cast<uint8_t*>(buffer_ptr.host_address());
+    for (uint32_t y = 0; y < rows; y++) {
+      std::memcpy(dest + size_t(y) * stride,
+                  imageData + size_t(y) * width * sizeof(uint32_t), row_size);
+    }
+
+    stbi_image_free(imageData);
   }
-
-  memcpy(buffer_ptr, imageData,
-         std::min(buffer_size, static_cast<size_t>(icon_dimmension_size *
-                                                   sizeof(uint32_t))));
-
-  stbi_image_free(imageData);
 
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediate(overlapped_ptr,
