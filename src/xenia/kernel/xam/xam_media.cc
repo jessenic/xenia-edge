@@ -99,12 +99,28 @@ constexpr X_HRESULT kExtraAVCodecsNotFound =
     X_HRESULT_FROM_NT(X_STATUS_OBJECT_NAME_NOT_FOUND);
 constexpr X_HRESULT kErrorPointer = 0x80004003;
 
-dword_result_t XamLoadExtraAVCodecs2_entry(lpdword_t module_handle_ptr) {
+// Two codec modules share one loader: ordinals 0x7DC/0x7DD load and unload the
+// first, 0x7E3/0x7E4 the second.
+static dword_result_t LoadExtraAVCodecs(lpdword_t module_handle_ptr) {
   if (!module_handle_ptr) {
     return kErrorPointer;
   }
   *module_handle_ptr = 0;
   return kExtraAVCodecsNotFound;
+}
+
+dword_result_t XamLoadExtraAVCodecs_entry(lpdword_t module_handle_ptr) {
+  return LoadExtraAVCodecs(module_handle_ptr);
+}
+DECLARE_XAM_EXPORT1(XamLoadExtraAVCodecs, kNone, kStub);
+
+void XamUnloadExtraAVCodecs_entry() {
+  // Nothing was loaded.
+}
+DECLARE_XAM_EXPORT1(XamUnloadExtraAVCodecs, kNone, kStub);
+
+dword_result_t XamLoadExtraAVCodecs2_entry(lpdword_t module_handle_ptr) {
+  return LoadExtraAVCodecs(module_handle_ptr);
 }
 DECLARE_XAM_EXPORT1(XamLoadExtraAVCodecs2, kNone, kStub);
 
@@ -112,14 +128,6 @@ void XamUnloadExtraAVCodecs2_entry() {
   // Nothing was loaded.
 }
 DECLARE_XAM_EXPORT1(XamUnloadExtraAVCodecs2, kNone, kStub);
-
-void XamGetDashBackstackNodesCount_entry() {
-  // On the 17559 xam this ordinal (0x7DD) is the unload that pairs with 0x7DC,
-  // like the 0x7E3/0x7E4 extra codecs pair: no arguments, and npctrl calls it
-  // to drop the first extra codecs module. Nothing was loaded, so there is
-  // nothing to drop.
-}
-DECLARE_XAM_EXPORT1(XamGetDashBackstackNodesCount, kNone, kSketchy);
 
 }  // namespace xam
 }  // namespace kernel
