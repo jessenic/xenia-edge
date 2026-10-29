@@ -9,8 +9,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <fstream>
 #include <thread>
+#include <vector>
 
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
@@ -559,6 +562,44 @@ dword_result_t XamContentCreateInternal_entry(
 }
 DECLARE_XAM_EXPORT1(XamContentCreateInternal, kContent, kImplemented);
 
+// Packages can only be mounted from host files, so one inside a container
+// such as a Games on Demand package is copied out to the cache first. A copy
+// of the same size from an earlier run is reused.
+static std::filesystem::path GetContentFileHostPath(vfs::Entry* entry) {
+  if (auto host_entry = dynamic_cast<vfs::HostPathEntry*>(entry)) {
+    return host_entry->host_path();
+  }
+  const std::filesystem::path cache_path =
+      kernel_state()->emulator()->cache_root() / "content_files" /
+      fmt::format("{:08X}", kernel_state()->title_id()) /
+      xe::to_path(entry->name());
+  std::error_code error;
+  if (std::filesystem::is_regular_file(cache_path, error) &&
+      std::filesystem::file_size(cache_path, error) == entry->size()) {
+    return cache_path;
+  }
+
+  vfs::File* file = nullptr;
+  if (entry->Open(vfs::FileAccess::kFileReadData, &file) != X_STATUS_SUCCESS ||
+      !file) {
+    return {};
+  }
+  std::vector<uint8_t> data(entry->size());
+  size_t bytes_read = 0;
+  const X_STATUS status = file->ReadSync(data, 0, &bytes_read);
+  file->Destroy();
+  if (status != X_STATUS_SUCCESS || bytes_read != data.size()) {
+    return {};
+  }
+  std::filesystem::create_directories(cache_path.parent_path(), error);
+  std::ofstream out(cache_path, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char*>(data.data()), data.size());
+  if (!out) {
+    return {};
+  }
+  return cache_path;
+}
+
 dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
@@ -570,13 +611,12 @@ dword_result_t XamContentOpenFile_entry(
               disposition_ptr, license_mask_ptr](uint32_t& extended_error,
                                                  uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_FILE_NOT_FOUND;
-    // Packages are opened from host files, so this misses ones inside a disc
-    // image.
-    auto entry = dynamic_cast<vfs::HostPathEntry*>(
-        kernel_state()->file_system()->ResolvePath(path));
-    if (entry) {
-      result = kernel_state()->content_manager()->OpenContentFile(
-          root_name, entry->host_path());
+    if (auto entry = kernel_state()->file_system()->ResolvePath(path)) {
+      const std::filesystem::path host_path = GetContentFileHostPath(entry);
+      if (!host_path.empty()) {
+        result = kernel_state()->content_manager()->OpenContentFile(root_name,
+                                                                    host_path);
+      }
     }
     auto disposition = XSUCCEEDED(result) ? kDispositionState::Open
                                           : kDispositionState::Unknown;
