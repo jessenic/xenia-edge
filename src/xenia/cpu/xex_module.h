@@ -244,8 +244,10 @@ class XexModule : public xe::cpu::Module {
     if (!base_address_) {
       return false;
     }
+    // Only the MZ signature is required; CLR native images (.ni.dll) zero the
+    // rest of the DOS header.
     uint8_t* buffer = memory()->TranslateVirtual(base_address_);
-    return *(uint32_t*)buffer == 0x905A4D;
+    return buffer[0] == 'M' && buffer[1] == 'Z';
   }
 
   bool is_patch() const {
