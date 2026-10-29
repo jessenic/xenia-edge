@@ -346,6 +346,51 @@ dword_result_t RtlUnicodeStringToAnsiString_entry(
 }
 DECLARE_XBOXKRNL_EXPORT1(RtlUnicodeStringToAnsiString, kNone, kImplemented);
 
+// Each byte widens to one character, as RtlMultiByteToUnicodeN does here. The
+// result is terminated when there is room, and the room for that is what an
+// allocated buffer adds.
+dword_result_t RtlAnsiStringToUnicodeString_entry(
+    pointer_t<X_UNICODE_STRING> destination_ptr,
+    pointer_t<X_ANSI_STRING> source_ptr, dword_t alloc_dest) {
+  if (!destination_ptr || !source_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const uint32_t char_count = source_ptr->length;
+  const uint32_t unicode_size = (char_count + 1) * 2;
+  if (unicode_size > 0xFFFF || (char_count && !source_ptr->pointer)) {
+    return X_STATUS_INVALID_PARAMETER_2;
+  }
+  const uint16_t length = uint16_t(char_count * 2);
+  if (alloc_dest) {
+    const uint32_t buffer_ptr = kernel_memory()->SystemHeapAlloc(unicode_size);
+    if (!buffer_ptr) {
+      return X_STATUS_NO_MEMORY;
+    }
+    destination_ptr->pointer = buffer_ptr;
+    destination_ptr->maximum_length = uint16_t(unicode_size);
+  } else if (length > destination_ptr->maximum_length ||
+             (char_count && !destination_ptr->pointer)) {
+    return X_STATUS_BUFFER_OVERFLOW;
+  }
+  destination_ptr->length = length;
+
+  auto dest = kernel_memory()->TranslateVirtual<xe::be<uint16_t>*>(
+      destination_ptr->pointer);
+  if (char_count) {
+    auto src =
+        kernel_memory()->TranslateVirtual<const uint8_t*>(source_ptr->pointer);
+    for (uint32_t i = 0; i < char_count; ++i) {
+      dest[i] = src[i];
+    }
+  }
+  if (destination_ptr->pointer &&
+      length + 2u <= destination_ptr->maximum_length) {
+    dest[char_count] = 0;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(RtlAnsiStringToUnicodeString, kNone, kImplemented);
+
 // https://msdn.microsoft.com/en-us/library/ff553113
 dword_result_t RtlMultiByteToUnicodeN_entry(lpword_t destination_ptr,
                                             dword_t destination_len,
