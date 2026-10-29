@@ -167,8 +167,10 @@ def import_vs_environment():
     install_path = None
     env_tool_args = None
 
+    # Backslashes: Python 3.15 won't launch a relative path with forward ones.
     vswhere = subprocess.check_output(
-        "tools/vswhere/vswhere.exe -version \"[17,)\" -latest -prerelease -format json -utf8 -products"
+        os.path.join("tools", "vswhere", "vswhere.exe") +
+        " -version \"[17,)\" -latest -prerelease -format json -utf8 -products"
         " Microsoft.VisualStudio.Product.Enterprise"
         " Microsoft.VisualStudio.Product.Professional"
         " Microsoft.VisualStudio.Product.Community"
