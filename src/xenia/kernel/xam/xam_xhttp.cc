@@ -1065,14 +1065,22 @@ dword_result_t NetDll_XHttpQueryHeaders_entry(dword_t caller, dword_t request,
 
   uint8_t* out = buffer.as<uint8_t*>();
   if (modifiers & kXHttpQueryFlagNumber) {
+    // A number fills the caller's buffer as a 64-bit value when it can hold
+    // one; npctrl keeps a response's remaining length in 64 bits.
     if (*buffer_length_ptr < 4) {
       *buffer_length_ptr = 4;
       XThread::SetLastError(X_ERROR_INSUFFICIENT_BUFFER);
       return 0;
     }
-    xe::store_and_swap<uint32_t>(
-        out, uint32_t(std::strtoul(std::string(*value).c_str(), nullptr, 10)));
-    *buffer_length_ptr = 4;
+    const uint64_t number =
+        std::strtoull(std::string(*value).c_str(), nullptr, 10);
+    if (*buffer_length_ptr >= 8) {
+      xe::store_and_swap<uint64_t>(out, number);
+      *buffer_length_ptr = 8;
+    } else {
+      xe::store_and_swap<uint32_t>(out, uint32_t(number));
+      *buffer_length_ptr = 4;
+    }
   } else if (modifiers & kXHttpQueryFlagSystemTime) {
     if (*buffer_length_ptr < 16) {
       *buffer_length_ptr = 16;
