@@ -11,6 +11,7 @@
 #define XENIA_KERNEL_XAM_CONTENT_MANAGER_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -125,12 +126,6 @@ struct XCONTENT_AGGREGATE_DATA : XCONTENT_DATA {
   }
 };
 static_assert_size(XCONTENT_AGGREGATE_DATA, 0x148);
-
-struct XCONTENT_CROSS_TITLE_DATA {
-  XCONTENT_DATA content_data;
-  xe::be<uint32_t> title_id;
-};
-static_assert_size(XCONTENT_CROSS_TITLE_DATA, 0x138);
 
 struct XCONTENT_DATA_MEDIA {
   be<uint8_t> series_id[0x10];  // 0x0 sz:0x10
@@ -258,6 +253,14 @@ class ContentManager {
       const uint32_t device_id, const uint64_t xuid, const uint32_t title_id,
       const XContentType content_type) const;
 
+  // The titles with content stored on the device for the user, and the content
+  // types a title has there, for listing content across titles.
+  std::vector<uint32_t> ListContentTitleIds(const uint32_t device_id,
+                                            const uint64_t xuid) const;
+  std::vector<XContentType> ListContentTypes(const uint32_t device_id,
+                                             const uint64_t xuid,
+                                             const uint32_t title_id) const;
+
   std::vector<XCONTENT_AGGREGATE_DATA> ListContentODD(
       const uint32_t device_id, const uint64_t xuid, const uint32_t title_id,
       const XContentType content_type) const;
@@ -298,6 +301,10 @@ class ContentManager {
   X_RESULT GetContentThumbnail(const uint64_t xuid,
                                const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t>* buffer);
+  // The package header's metadata, an XContentMetadata.
+  X_RESULT GetContentMetadata(const uint64_t xuid,
+                              const XCONTENT_AGGREGATE_DATA& data,
+                              std::vector<uint8_t>* buffer);
   X_RESULT SetContentThumbnail(const uint64_t xuid,
                                const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t> buffer);
@@ -322,6 +329,12 @@ class ContentManager {
   std::string ResolveDiscPackageRoot(const uint64_t xuid, uint32_t title_id,
                                      const XContentType content_type) const;
   vfs::Entry* ResolveDiscPackage(const XCONTENT_AGGREGATE_DATA& data) const;
+  // The folders named by 8 hex digits in the user's content folder on the
+  // device, or in its folder for |title_id|, as title IDs and content types
+  // are.
+  std::vector<uint32_t> ListHexFolders(
+      const uint32_t device_id, const uint64_t xuid,
+      const std::optional<uint32_t> title_id) const;
   // Closes |package| and the packages mounted from files in it.
   void ClosePackage(ContentPackage* package);
 

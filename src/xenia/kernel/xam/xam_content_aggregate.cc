@@ -21,7 +21,8 @@ namespace xe {
 namespace kernel {
 namespace xam {
 
-// Alias XContentCreateCrossTitleEnumerator
+// Alias XContentCreateCrossTitleEnumerator. Title 0 lists the content of every
+// title and type 0xFFFFFFFF that of every type.
 dword_result_t XamContentAggregateCreateEnumerator_entry(qword_t xuid,
                                                          dword_t device_id,
                                                          dword_t content_type,
@@ -34,8 +35,7 @@ dword_result_t XamContentAggregateCreateEnumerator_entry(qword_t xuid,
     return X_E_INVALIDARG;
   }
 
-  auto e = make_object<XStaticEnumerator<XCONTENT_CROSS_TITLE_DATA>>(
-      kernel_state(), 1);
+  auto e = make_object<ContentAggregateEnumerator>(kernel_state(), 1);
   X_KENUMERATOR_CONTENT_AGGREGATE* extra;
   auto result = e->Initialize(XUserIndexAny, 0xFE, 0x2000E, 0x20010, 0, &extra);
   if (XFAILED(result)) {
@@ -45,56 +45,62 @@ dword_result_t XamContentAggregateCreateEnumerator_entry(qword_t xuid,
   extra->magic = kXObjSignature;
   extra->handle = e->handle();
 
-  const XContentType content_type_enum =
-      static_cast<XContentType>(content_type.value());
-
   // Fetch any alternate title IDs defined in the XEX header
   // (used by games to load saves from other titles, etc)
-  std::vector<uint32_t> title_ids{title_id ? title_id.value()
-                                           : kCurrentlyRunningTitleId};
+  std::vector<uint32_t> alt_ids;
   auto exe_module = kernel_state()->GetExecutableModule();
   if (exe_module && exe_module->xex_module()) {
-    const auto& alt_ids = exe_module->xex_module()->opt_alternate_title_ids();
-    std::ranges::copy(alt_ids, std::back_inserter(title_ids));
+    alt_ids = exe_module->xex_module()->opt_alternate_title_ids();
   }
-
-  auto append_items =
-      [&e](const std::vector<XCONTENT_AGGREGATE_DATA>& content_datas) {
-        for (const auto& content_data : content_datas) {
-          auto item = e->AppendItem();
-          assert_not_null(item);
-          if (item) {
-            item->content_data.device_id = content_data.device_id;
-            item->content_data.content_type = content_data.content_type;
-            item->content_data.display_name_raw = content_data.display_name_raw;
-            std::memcpy(item->content_data.file_name_raw,
-                        content_data.file_name_raw,
-                        sizeof(content_data.file_name_raw));
-            item->content_data.padding[0] = 0;
-            item->content_data.padding[1] = 0;
-
-            item->title_id = content_data.title_id;
-          }
-        }
-      };
+  std::vector<uint32_t> own_title_ids{kernel_state()->title_id()};
+  std::ranges::copy(alt_ids, std::back_inserter(own_title_ids));
 
   auto content_manager = kernel_state()->content_manager();
-  if (!device_info || device_info->device_type == DeviceType::HDD) {
-    for (const auto& title_id : title_ids) {
-      append_items(content_manager->ListContent(
-          static_cast<uint32_t>(DummyDeviceId::HDD),
-          xuid == -1 ? 0 : static_cast<uint64_t>(xuid), title_id,
-          content_type_enum));
+  auto append_device = [&](DummyDeviceId device, uint64_t device_xuid) {
+    const uint32_t device_index = static_cast<uint32_t>(device);
+    std::vector<uint32_t> title_ids;
+    if (title_id) {
+      title_ids.push_back(title_id.value());
+      std::ranges::copy(alt_ids, std::back_inserter(title_ids));
+    } else {
+      title_ids =
+          content_manager->ListContentTitleIds(device_index, device_xuid);
     }
+    for (const uint32_t item_title_id : title_ids) {
+      // Title 0 only reaches past the title's own content with
+      // ContentAggregateEnumerator::kAllTitlesFlag.
+      const bool other_title =
+          !title_id && std::ranges::find(own_title_ids, item_title_id) ==
+                           own_title_ids.end();
+      std::vector<XContentType> types;
+      if (content_type == 0xFFFFFFFF) {
+        types = content_manager->ListContentTypes(device_index, device_xuid,
+                                                  item_title_id);
+      } else {
+        types.push_back(static_cast<XContentType>(content_type.value()));
+      }
+      for (const XContentType type : types) {
+        const auto content_datas =
+            device == DummyDeviceId::ODD
+                ? content_manager->ListContentODD(device_index, device_xuid,
+                                                  item_title_id, type)
+                : content_manager->ListContent(device_index, device_xuid,
+                                               item_title_id, type);
+        for (const auto& content_data : content_datas) {
+          e->AppendItem(content_data, other_title);
+        }
+      }
+    }
+  };
+
+  if (!device_info || device_info->device_type == DeviceType::HDD) {
+    append_device(DummyDeviceId::HDD,
+                  xuid == -1 ? 0 : static_cast<uint64_t>(xuid));
   }
 
   // Disc content is stored under XUID 0.
   if (!device_info || device_info->device_type == DeviceType::ODD) {
-    for (const auto& title_id : title_ids) {
-      append_items(content_manager->ListContentODD(
-          static_cast<uint32_t>(DummyDeviceId::ODD), 0, title_id,
-          content_type_enum));
-    }
+    append_device(DummyDeviceId::ODD, 0);
   }
 
   XELOGD("XamContentAggregateCreateEnumerator: added {} items to enumerator",

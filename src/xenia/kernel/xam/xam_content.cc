@@ -987,9 +987,10 @@ DECLARE_XAM_EXPORT1(XamLoaderGetMediaInfo, kNone, kStub);
 constexpr std::string_view kLaunchRootName = "XSYSLAUNCH";
 
 // Launches |xex_name| in the package open at the launch root.
-static void LaunchOpenedImage(const std::string& xex_name, bool on_disc) {
+static void LaunchOpenedImage(const std::string& xex_name, bool on_disc,
+                              uint32_t flags) {
   LaunchTitle(fmt::format("{}:\\{}", kLaunchRootName, xex_name), {},
-              on_disc ? 0x80 : 0);
+              flags | (on_disc ? 0x80 : 0));
 }
 
 dword_result_t XamContentLaunchImageFromFileInternal_entry(
@@ -1013,14 +1014,15 @@ dword_result_t XamContentLaunchImageFromFileInternal_entry(
   const vfs::Entry* title_root = kernel_state()->file_system()->ResolvePath(
       kernel_state()->title_mount_path_);
   LaunchOpenedImage(xex_name ? xex_name.value() : std::string(),
-                    title_root && title_root->device() == entry->device());
+                    title_root && title_root->device() == entry->device(), 0);
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamContentLaunchImageFromFileInternal, kContent, kSketchy);
 
 static X_RESULT LaunchContentImage(uint32_t user_index,
                                    const XCONTENT_AGGREGATE_DATA& content_data,
-                                   const std::string& xex_name) {
+                                   const std::string& xex_name,
+                                   uint32_t flags) {
   auto content_manager = kernel_state()->content_manager();
   uint64_t xuid = 0;
   X_RESULT result = ContentXuid(user_index, xuid);
@@ -1039,8 +1041,10 @@ static X_RESULT LaunchContentImage(uint32_t user_index,
     return result;
   }
 
-  LaunchOpenedImage(xex_name, content_data.device_id ==
-                                  static_cast<uint32_t>(DummyDeviceId::ODD));
+  LaunchOpenedImage(
+      xex_name,
+      content_data.device_id == static_cast<uint32_t>(DummyDeviceId::ODD),
+      flags);
   return X_ERROR_SUCCESS;
 }
 
@@ -1051,7 +1055,7 @@ dword_result_t XamContentLaunchImage_entry(dword_t user_index,
     return X_ERROR_INVALID_PARAMETER;
   }
   return LaunchContentImage(user_index, *content_data_ptr.as<XCONTENT_DATA*>(),
-                            xex_name ? xex_name.value() : std::string());
+                            xex_name ? xex_name.value() : std::string(), 0);
 }
 DECLARE_XAM_EXPORT1(XamContentLaunchImage, kContent, kSketchy);
 
@@ -1063,9 +1067,38 @@ dword_result_t XamContentLaunchImageInternal_entry(lpvoid_t content_data_ptr,
   // XCONTENT_DATA_INTERNAL has the XUID and title ID at the same offsets.
   return LaunchContentImage(XUserIndexNone,
                             *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>(),
-                            xex_name ? xex_name.value() : std::string());
+                            xex_name ? xex_name.value() : std::string(), 0);
 }
 DECLARE_XAM_EXPORT1(XamContentLaunchImageInternal, kContent, kSketchy);
+
+// Fills the XContentMetadata of the package's header.
+dword_result_t XamContentGetMetaDataInternal_entry(
+    lpvoid_t content_data_ptr, lpvoid_t metadata_ptr,
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!content_data_ptr || !metadata_ptr) {
+    return CompleteRequest(overlapped_ptr, X_ERROR_INVALID_PARAMETER);
+  }
+  std::vector<uint8_t> metadata;
+  X_RESULT result = kernel_state()->content_manager()->GetContentMetadata(
+      0, *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>(), &metadata);
+  if (!result) {
+    std::memcpy(metadata_ptr, metadata.data(), metadata.size());
+  }
+  return CompleteRequest(overlapped_ptr, result);
+}
+DECLARE_XAM_EXPORT1(XamContentGetMetaDataInternal, kContent, kImplemented);
+
+dword_result_t XamContentLaunchImageInternalEx_entry(lpvoid_t content_data_ptr,
+                                                     lpstring_t xex_name,
+                                                     dword_t flags) {
+  if (!content_data_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return LaunchContentImage(XUserIndexNone,
+                            *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>(),
+                            xex_name ? xex_name.value() : std::string(), flags);
+}
+DECLARE_XAM_EXPORT1(XamContentLaunchImageInternalEx, kContent, kSketchy);
 
 void XamContentRegisterChangeCallback_entry(dword_t callback) {
   kernel_state()->xam_state()->SetContentRegisterCallback(callback);
