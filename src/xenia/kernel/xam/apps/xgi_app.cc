@@ -8,6 +8,8 @@
  */
 
 #include "xenia/kernel/xam/apps/xgi_app.h"
+#include "xenia/kernel/title_id_utils.h"
+#include "xenia/kernel/xam/user_settings.h"
 #include "xenia/kernel/xsession.h"
 
 #include "xenia/base/logging.h"
@@ -101,6 +103,109 @@ struct XUSER_ANID {
   xe::be<uint32_t> pszAnIdBuffer;
   xe::be<uint32_t> value_const;  // 1
 };
+
+// XamUserReadUserPreference and XamUserWriteUserPreference send this, with
+// the value's address for a read and the value for a write.
+struct XGI_USER_PREFERENCE {
+  xe::be<uint32_t> user_index;
+  xe::be<uint32_t> preference;
+  xe::be<uint32_t> value;
+};
+static_assert_size(XGI_USER_PREFERENCE, 0xC);
+
+// The console keeps user preferences as bits of one of the dashboard's
+// profile settings, read and written by mask. Masks 6 and 0x18 have a bit of
+// their own that a write sets, and a read of one never written returns 1.
+constexpr uint32_t kUserPreferencesSettingId = 0x10040053;
+
+static bool IsUserPreference(uint32_t preference) {
+  switch (preference) {
+    case 0x1:
+    case 0x6:
+    case 0x18:
+    case 0x20:
+    case 0x40:
+    case 0x80:
+    case 0x100:
+    case 0x200:
+      return true;
+  }
+  return false;
+}
+
+static uint32_t UserPreferenceWrittenBit(uint32_t preference) {
+  switch (preference) {
+    case 0x6:
+      return 0x4;
+    case 0x18:
+      return 0x10;
+  }
+  return 0;
+}
+
+static X_HRESULT ReadUserPreferences(KernelState* kernel_state,
+                                     uint32_t user_index, uint32_t& bits) {
+  if (user_index >= XUserMaxUserCount) {
+    return X_E_INVALIDARG;
+  }
+  const auto user = kernel_state->xam_state()->GetUserProfile(user_index);
+  if (!user) {
+    return X_E_INVALIDARG;
+  }
+  bits = 0;
+  if (const auto setting =
+          kernel_state->xam_state()->user_tracker()->GetSetting(
+              user, kDashboardID, kUserPreferencesSettingId)) {
+    bits = static_cast<uint32_t>(std::get<int32_t>(setting->get_host_data()));
+  }
+  return X_E_SUCCESS;
+}
+
+X_HRESULT XgiApp::ReadUserPreference(uint32_t user_index, uint32_t preference,
+                                     uint32_t& value) {
+  if (!IsUserPreference(preference)) {
+    return X_E_INVALIDARG;
+  }
+  uint32_t bits = 0;
+  if (const X_HRESULT result =
+          ReadUserPreferences(kernel_state_, user_index, bits);
+      result < 0) {
+    return result;
+  }
+  value = bits & preference;
+  const uint32_t written_bit = UserPreferenceWrittenBit(preference);
+  if (!written_bit) {
+    return X_E_SUCCESS;
+  }
+  if (!(value & written_bit)) {
+    return 1;
+  }
+  value &= ~written_bit;
+  return X_E_SUCCESS;
+}
+
+X_HRESULT XgiApp::WriteUserPreference(uint32_t user_index, uint32_t preference,
+                                      uint32_t value) {
+  const uint32_t written_bit = UserPreferenceWrittenBit(preference);
+  if (user_index >= XUserMaxUserCount || !IsUserPreference(preference) ||
+      (value | preference) != preference || (value & written_bit)) {
+    return X_E_INVALIDARG;
+  }
+  uint32_t bits = 0;
+  if (const X_HRESULT result =
+          ReadUserPreferences(kernel_state_, user_index, bits);
+      result < 0) {
+    return result;
+  }
+  bits = (bits & ~preference) | value | written_bit;
+  const auto user = kernel_state_->xam_state()->GetUserProfile(user_index);
+  const UserSetting setting(
+      static_cast<UserSettingId>(kUserPreferencesSettingId),
+      static_cast<int32_t>(bits));
+  kernel_state_->xam_state()->user_tracker()->UpsertSetting(
+      user->xuid(), kDashboardID, &setting);
+  return X_E_SUCCESS;
+}
 
 XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
 
@@ -444,6 +549,31 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
 
       return X_E_SUCCESS;
+    }
+    case 0x000B0082: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XGI_USER_PREFERENCE));
+      const auto* request =
+          reinterpret_cast<const XGI_USER_PREFERENCE*>(buffer);
+      if (!request->value) {
+        return X_E_INVALIDARG;
+      }
+      uint32_t value = 0;
+      const X_HRESULT result =
+          ReadUserPreference(request->user_index, request->preference, value);
+      if (result >= 0) {
+        xe::store_and_swap<uint32_t>(memory_->TranslateVirtual(request->value),
+                                     value);
+      }
+      return result;
+    }
+    case 0x000B0083: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XGI_USER_PREFERENCE));
+      const auto* request =
+          reinterpret_cast<const XGI_USER_PREFERENCE*>(buffer);
+      return WriteUserPreference(request->user_index, request->preference,
+                                 request->value);
     }
   }
   XELOGE(

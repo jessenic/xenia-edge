@@ -1087,6 +1087,26 @@ X_RESULT xeXamShowSigninUI(uint32_t user_index, uint32_t users_needed,
     return X_ERROR_ACCESS_DENIED;
   }
 
+  // The dashboard signs in the profile chosen on its own sign-in screen with
+  // XamUserLogonEx, then asks for the sign-in to be completed for that slot.
+  // There's no profile to pick then, so complete it without the picker, and
+  // announce the sign-in again as the console's sign-in UI does when it ends.
+  if ((flags & static_cast<uint32_t>(SigninUiFlags::CompleteSignIn)) &&
+      user_index < XUserMaxUserCount &&
+      kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
+    // The dashboard waits for the UI to show and then close.
+    kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+    kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
+    std::thread([user_index]() {
+      xe::threading::Sleep(kUIDelayMillis);
+      kernel_state()->BroadcastNotification(kXNotificationSystemSignInChanged,
+                                            1u << user_index);
+      kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+      kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
+    }).detach();
+    return X_ERROR_SUCCESS;
+  }
+
   kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
 
   auto close = [](ui::SigninUI* dialog) -> void {};

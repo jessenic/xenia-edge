@@ -1144,6 +1144,10 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     listener->EnqueueNotification(kXNotificationSystemUI,
                                   xam_state()->IsUIActive());
     listener->EnqueueNotification(kXNotificationSystemSignInChanged, 1);
+    // The console's xam sends this with 0 for each content device it adds,
+    // and its drives come up as a title starts. These were all there before,
+    // so announce them once. The dashboard only lists content after it.
+    listener->EnqueueNotification(kXNotificationSystemStorageDevicesChanged, 0);
   }
   if (!has_notified_live_startup_ && listener->mask() & kXNotifyLive) {
     has_notified_live_startup_ = true;
